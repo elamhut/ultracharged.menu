@@ -98,6 +98,14 @@ is reused for a few seconds rather than re-run on every keystroke.
 
 <img width="612" height="285" alt="image" src="https://github.com/user-attachments/assets/9d0e490d-c74d-466c-82a9-f0d05adf9f27" />
 
+### Edit the search line
+
+The search line has a real caret. Press **Tab** or click the search line to
+enter text mode; **Tab** or **Escape** leaves it. In text mode **←/→** move
+the caret, **Home/End** jump to the ends, **Backspace** deletes before the
+caret (**Ctrl+Backspace** deletes a word), and typing or pasting lands at the
+caret. Outside text mode, keys navigate the list as before.
+
 ### Calculator
 
 | Type | Get |
@@ -146,5 +154,5 @@ guessing at. Crypto is not supported — the rate source is fiat only.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/elamhut/ultracharged-menu --enable
+omarchy plugin add https://github.com/elamhut/ultracharged.menu --enable
 omarchy restart shell

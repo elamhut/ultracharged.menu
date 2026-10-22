@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "id": "elamhut.ultracharged-menu",
+  "id": "elamhut.ultracharged.menu",
   "name": "Ultracharged Omarchy menu",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "author": "elamhut (fork of Nikolajus Krauklis's Supercharged menu)",
   "description": "Quickshell-powered Omarchy command menu supercharged with links/web search, unit conversion, time zones, dev utilities (uuid, password, sha256, base64, urlencode, epoch), process killing, a calculator, and currency conversion",
   "kinds": [
