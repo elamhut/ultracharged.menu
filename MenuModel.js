@@ -337,12 +337,39 @@ function leafIdFor(id) {
   return parts.length > 0 ? parts[parts.length - 1] : id
 }
 
+// Other words people reach for, by menu id. These are not `aliases`: an alias
+// is also an `omarchy menu summon` route, and "restart" is already Update's.
+// A synonym only finds the entry. Adding one is one line here.
+var SEARCH_SYNONYMS = ({
+  "system.reboot": ["restart"],
+  "system.shutdown": ["turn off"]
+})
+
+function synonymsFor(entry) {
+  if (!entry || !Object.prototype.hasOwnProperty.call(SEARCH_SYNONYMS, entry.id)) return []
+  return SEARCH_SYNONYMS[entry.id]
+}
+
 function nameSearchText(entry) {
   if (!entry) return ""
   var aliases = []
   var values = Array.isArray(entry.aliases) ? entry.aliases : []
   for (var i = 0; i < values.length; i++) aliases.push(searchableToken(values[i]))
-  return [entry.label, searchableToken(leafIdFor(entry.id)), aliases.join(" ")].join(" ").toLowerCase()
+  return [entry.label, searchableToken(leafIdFor(entry.id)), aliases.join(" "), synonymsFor(entry).join(" ")].join(" ").toLowerCase()
+}
+
+// How closely a synonym answers the query: 0 for the whole of it, 1 for its
+// start, -1 for neither. A synonym is meant as another name for the entry, so
+// it ranks almost as a label would.
+function synonymMatch(entry, needle) {
+  var synonyms = synonymsFor(entry)
+  var best = -1
+  for (var i = 0; i < synonyms.length; i++) {
+    var synonym = synonyms[i].toLowerCase()
+    if (synonym === needle) return 0
+    if (synonym.indexOf(needle) === 0) best = 1
+  }
+  return best
 }
 
 function termInSearchWords(term, text) {
@@ -385,12 +412,14 @@ function searchScore(items, entry, query) {
   var nameText = nameSearchText(entry)
   var descriptionText = String(entry.description || "").toLowerCase()
   var score = 80
+  var synonym = synonymMatch(entry, needle)
 
   if (label === needle) score = entry.parent === "root" ? 2 : 0
+  else if (synonym === 0) score = 5
   // An installed app whose name contains the query as a whole word ("zen"
   // for Zen Browser) beats exact-labeled menu entries like Install > Zen.
   else if (entry.kind === "app" && label.split(/\s+/).indexOf(needle) >= 0) score = 0
-  else if (label.indexOf(needle) === 0) score = 10
+  else if (label.indexOf(needle) === 0 || synonym === 1) score = 10
   else if (label.indexOf(needle) >= 0) score = 30
   else if (nameText.indexOf(needle) >= 0) score = 40
   else if (descriptionTextMatches(needle, descriptionText)) score = 60
@@ -529,6 +558,31 @@ function guardScript(items) {
   }
 
   return guards ? guardPrelude(guards) + guards : ""
+}
+
+// --- Dead keys ---------------------------------------------------------------
+// Layouts like US international make ^ ` ~ ' " dead keys: they wait for the
+// next key and combine with it. A text field gets that from the input method,
+// but the menu reads raw key events, so it combines them itself, the way the
+// layout would: an accent onto a letter that takes it, the accent alone on
+// space, and the accent followed by the key on anything else -- so "2^4"
+// types as written.
+
+var DEAD_KEYS = ({
+  "^":  { from: "aeiouAEIOU",     to: "âêîôûÂÊÎÔÛ" },
+  "`":  { from: "aeiouAEIOU",     to: "àèìòùÀÈÌÒÙ" },
+  "~":  { from: "aonAON",         to: "ãõñÃÕÑ" },
+  "'":  { from: "aeiouycAEIOUYC", to: "áéíóúýçÁÉÍÓÚÝÇ" },
+  "\"": { from: "aeiouyAEIOUY",   to: "äëïöüÿÄËÏÖÜŸ" }
+})
+
+function composeDeadKey(dead, next) {
+  var table = DEAD_KEYS[dead]
+  var text = String(next || "")
+  if (!table) return dead + text
+  if (text === " ") return dead
+  var at = text.length === 1 ? table.from.indexOf(text) : -1
+  return at >= 0 ? table.to.charAt(at) : dead + text
 }
 
 // --- Calculator -------------------------------------------------------------
@@ -991,6 +1045,77 @@ function currencyRatesStale(snapshot, nowSeconds) {
   return true
 }
 
+// --- Stocks ------------------------------------------------------------------
+// "$auvp11" quotes a ticker from Yahoo Finance's public endpoints: search to
+// turn what was typed into Yahoo's symbol (AUVP11 trades as AUVP11.SA), then
+// the chart endpoint for the price. A ticker starts with a letter, which is
+// what keeps "$120 to eur" a currency conversion.
+
+// The ticker, upper-cased; "" for a bare "$" (a row that asks for one); null
+// when the search is not a quote at all. The character set is the whole of
+// what Yahoo symbols use, and all that is ever put into a URL from here.
+function parseStockQuery(query) {
+  var text = String(query || "").trim()
+  if (text === "$") return ""
+  var match = text.match(/^\$\s*([A-Za-z^][A-Za-z0-9.^=-]{0,19})$/)
+  return match ? match[1].toUpperCase() : null
+}
+
+function stockSearchUrl(ticker) {
+  return "https://query1.finance.yahoo.com/v1/finance/search?quotesCount=1&newsCount=0&q="
+       + encodeURIComponent(ticker)
+}
+
+function stockPageUrl(symbol) {
+  return "https://finance.yahoo.com/quote/" + encodeURIComponent(symbol)
+}
+
+function stockLookupUrl(ticker) {
+  return "https://finance.yahoo.com/lookup?s=" + encodeURIComponent(ticker)
+}
+
+// The chart endpoint's `meta`, as much of it as a row needs, or null for
+// anything that is not a priced quote. The change is worked out from the
+// previous close rather than read: not every instrument reports it.
+function parseStockQuote(text) {
+  var parsed
+  try {
+    parsed = JSON.parse(String(text || ""))
+  } catch (e) {
+    return null
+  }
+
+  var result = parsed && parsed.chart && parsed.chart.result
+  var meta = result && result[0] && result[0].meta
+  if (!meta || typeof meta.symbol !== "string") return null
+  if (!/^[A-Za-z0-9.^=-]{1,24}$/.test(meta.symbol)) return null
+
+  var price = Number(meta.regularMarketPrice)
+  if (!isFinite(price)) return null
+  var previous = Number(meta.chartPreviousClose !== undefined ? meta.chartPreviousClose : meta.previousClose)
+  var change = isFinite(previous) && previous > 0 ? price - previous : null
+
+  return {
+    symbol: meta.symbol,
+    name: String(meta.shortName || meta.longName || meta.symbol).replace(/\s+/g, " ").trim(),
+    exchange: String(meta.fullExchangeName || meta.exchangeName || ""),
+    currency: /^[A-Za-z]{3}$/.test(meta.currency || "") ? String(meta.currency).toUpperCase() : "",
+    price: price,
+    change: change,
+    changePercent: change === null ? null : change / previous * 100,
+    time: isFinite(meta.regularMarketTime) ? Number(meta.regularMarketTime) : 0,
+    offset: isFinite(meta.gmtoffset) ? Number(meta.gmtoffset) : 0
+  }
+}
+
+// "▲ 1.30 (0.86%)", or "" when there is no change to show.
+function formatStockChange(quote) {
+  if (!quote || quote.change === null) return ""
+  var arrow = quote.change > 0 ? "▲" : (quote.change < 0 ? "▼" : "•")
+  return arrow + " " + formatCurrencyValue(Math.abs(quote.change))
+       + " (" + Math.abs(quote.changePercent).toFixed(2) + "%)"
+}
+
 // --- Links -------------------------------------------------------------------
 // A launcher that cannot open a link has a hole in it, and the search that
 // matched nothing is the one most likely to have been a URL pasted in or a
@@ -1048,6 +1173,34 @@ function webSearchUrl(query, template) {
   var url = String(template || "")
   if (!text || url.indexOf("{query}") < 0) return ""
   return url.split("{query}").join(encodeURIComponent(text))
+}
+
+// --- Bangs -------------------------------------------------------------------
+// DuckDuckGo-style prefixes that pick where a search goes: "!y cats" searches
+// YouTube. Adding one is one line here. A bare "!" takes the default engine,
+// which is the menu's own webSearchTemplate rather than an entry here.
+
+var BANGS = ({
+  y:   { name: "YouTube",       home: "https://www.youtube.com",          template: "https://www.youtube.com/results?search_query={query}" },
+  yh:  { name: "Yahoo",         home: "https://search.yahoo.com",         template: "https://search.yahoo.com/search?p={query}" },
+  g:   { name: "Google",        home: "https://www.google.com",           template: "https://www.google.com/search?q={query}" },
+  ddg: { name: "DuckDuckGo",    home: "https://duckduckgo.com",           template: "https://duckduckgo.com/?q={query}" },
+  a:   { name: "Amazon",        home: "https://www.amazon.com",           template: "https://www.amazon.com/s?k={query}" },
+  ml:  { name: "Mercado Livre", home: "https://www.mercadolivre.com.br",  template: "https://lista.mercadolivre.com.br/{query}" }
+})
+
+// Returns { engine, terms } for a known bang, where engine is null for a bare
+// "!". An unknown bang is not ours to answer, so it stays an ordinary search
+// -- and the default engine, DuckDuckGo, knows thousands more of them.
+function parseBangQuery(query) {
+  var match = String(query || "").trim().match(/^!(\S*)(?:\s+([\s\S]*))?$/)
+  if (!match) return null
+
+  var key = match[1].toLowerCase()
+  var terms = String(match[2] || "").trim()
+  if (key === "") return { engine: null, terms: terms }
+  if (!Object.prototype.hasOwnProperty.call(BANGS, key)) return null
+  return { engine: BANGS[key], terms: terms }
 }
 
 // --- Units -------------------------------------------------------------------
@@ -1516,6 +1669,172 @@ function formatMemory(kilobytes) {
   return (megabytes / 1024).toFixed(1) + " GB"
 }
 
+// --- Files -------------------------------------------------------------------
+// "?report" finds files by name under home. fd does the walking; this reads
+// what it printed and decides which few are worth a row.
+
+// The name being looked for, "" for a bare "?" (a row that asks for more),
+// or null when the search is not a file search at all.
+function parseFileQuery(query) {
+  var match = String(query || "").trim().match(/^\?\s*([\s\S]*)$/)
+  return match ? match[1].trim() : null
+}
+
+// One path as a row wants it: the name, the folder it sits in (under "~"
+// when it is in home), and how closely the name matches what was typed --
+// exact, then prefix, then anywhere. null when the name does not match.
+function describeFile(path, isDir, needle, home) {
+  var cut = path.lastIndexOf("/")
+  var name = path.slice(cut + 1)
+  var lower = name.toLowerCase()
+  var at = lower.indexOf(needle)
+  if (!name || at < 0) return null
+
+  var dir = path.slice(0, cut) || "/"
+  if (home && (dir === home || dir.indexOf(home + "/") === 0))
+    dir = "~" + dir.slice(home.length)
+
+  return {
+    path: path,
+    name: name,
+    dir: dir,
+    isDir: !!isDir,
+    rank: lower === needle ? 0 : (at === 0 ? 1 : 2),
+    depth: path.split("/").length
+  }
+}
+
+// `fd -0` output: NUL-separated absolute paths, directories ending in "/".
+// Output cut off by the byte ceiling ends mid-path, so a last entry with no
+// NUL after it is dropped rather than shown half-written. fd only matched the
+// name, not the order anyone wants, so the closest names come first, and
+// among equals the shallower and shorter path, which is usually the one meant.
+function parseFileList(text, filter, home, limit) {
+  var entries = String(text || "").split("\u0000")
+  entries.pop()
+  var needle = String(filter || "").toLowerCase()
+  var ceiling = limit > 0 ? limit : 8
+  var found = []
+
+  for (var i = 0; i < entries.length; i++) {
+    var path = entries[i]
+    if (!path) continue
+    var isDir = path.length > 1 && path.charAt(path.length - 1) === "/"
+    if (isDir) path = path.slice(0, -1)
+
+    var file = describeFile(path, isDir, needle, String(home || ""))
+    if (file) found.push(file)
+  }
+
+  found.sort(function(a, b) {
+    if (a.rank !== b.rank) return a.rank - b.rank
+    if (a.depth !== b.depth) return a.depth - b.depth
+    return a.path.length - b.path.length
+  })
+  return found.slice(0, ceiling)
+}
+
+// --- File favourites ---------------------------------------------------------
+// Files opened from the menu are remembered by frecency: every open adds one
+// to a score that halves for each fortnight it goes untouched. A plain count
+// would keep last year's project on top forever; this lets what is in use now
+// rise and what is done with sink, with nobody having to tidy the list.
+
+var FILE_HALF_LIFE = 14 * 24 * 3600   // seconds
+var FILE_HISTORY_CAP = 200
+
+// The score as of `now`, decayed from the last time it was written.
+function fileFrecency(entry, now) {
+  var age = Math.max(0, now - entry.at)
+  return entry.score * Math.pow(0.5, age / FILE_HALF_LIFE)
+}
+
+// The history file is ours, but it is still read as untrusted: anything that
+// is not an absolute path with a finite score is dropped, not trusted to be.
+function parseFileHistory(text) {
+  var parsed
+  try {
+    parsed = JSON.parse(String(text || ""))
+  } catch (e) {
+    return ({})
+  }
+
+  var files = parsed && typeof parsed.files === "object" ? parsed.files : null
+  var history = ({})
+  if (!files) return history
+
+  for (var path in files) {
+    if (!Object.prototype.hasOwnProperty.call(files, path)) continue
+    var entry = files[path]
+    if (typeof path !== "string" || path.charAt(0) !== "/" || path.length > 4096) continue
+    if (!entry || !isFinite(entry.score) || !isFinite(entry.at) || entry.score <= 0) continue
+    history[path] = { score: Number(entry.score), at: Number(entry.at), dir: !!entry.dir }
+  }
+  return history
+}
+
+// A new history with `path` opened at `now`. Past the cap, the entries that
+// have decayed the furthest are the ones let go.
+function recordFileOpen(history, path, isDir, now) {
+  var next = ({})
+  for (var key in history) {
+    if (Object.prototype.hasOwnProperty.call(history, key)) next[key] = history[key]
+  }
+
+  var known = next[path]
+  next[path] = {
+    score: (known ? fileFrecency(known, now) : 0) + 1,
+    at: now,
+    dir: !!isDir
+  }
+
+  var paths = Object.keys(next)
+  if (paths.length > FILE_HISTORY_CAP) {
+    paths.sort(function(a, b) { return fileFrecency(next[b], now) - fileFrecency(next[a], now) })
+    for (var i = FILE_HISTORY_CAP; i < paths.length; i++) delete next[paths[i]]
+  }
+  return next
+}
+
+function serializeFileHistory(history) {
+  return JSON.stringify({ version: 1, files: history })
+}
+
+// The favourites whose name matches what was typed -- all of them for an
+// empty filter -- most frecent first. Frecency outranks how well the name
+// matches: a favourite is one because it is the file that keeps being wanted.
+function rankedFileHistory(history, filter, home, now, limit) {
+  var needle = String(filter || "").toLowerCase()
+  var ceiling = limit > 0 ? limit : 8
+  var found = []
+
+  for (var path in history) {
+    if (!Object.prototype.hasOwnProperty.call(history, path)) continue
+    var file = describeFile(path, history[path].dir, needle, String(home || ""))
+    if (!file) continue
+    file.frecency = fileFrecency(history[path], now)
+    found.push(file)
+  }
+
+  found.sort(function(a, b) { return b.frecency - a.frecency })
+  return found.slice(0, ceiling)
+}
+
+// Favourites first, then what fd found, each path once and `limit` in all.
+function mergeFileResults(favourites, found, limit) {
+  var seen = ({})
+  var merged = []
+  var lists = [favourites, found]
+  for (var l = 0; l < lists.length; l++) {
+    for (var i = 0; i < lists[l].length && merged.length < limit; i++) {
+      if (seen[lists[l][i].path]) continue
+      seen[lists[l][i].path] = true
+      merged.push(lists[l][i])
+    }
+  }
+  return merged
+}
+
 // --- Time zones --------------------------------------------------------------
 // "time in tokyo". The engine QML runs has no Intl -- `toLocaleString` takes a
 // timeZone option and quietly ignores it -- so the zone database is the
@@ -1664,6 +1983,7 @@ if (typeof module !== "undefined") {
     matchesQuery: matchesQuery,
     searchScore: searchScore,
     displayRow: displayRow,
+    composeDeadKey: composeDeadKey,
     tokenizeMath: tokenizeMath,
     formatMathResult: formatMathResult,
     evaluateMath: evaluateMath,
@@ -1674,8 +1994,15 @@ if (typeof module !== "undefined") {
     formatCurrencyRate: formatCurrencyRate,
     parseCurrencyRates: parseCurrencyRates,
     currencyRatesStale: currencyRatesStale,
+    parseStockQuery: parseStockQuery,
+    stockSearchUrl: stockSearchUrl,
+    stockPageUrl: stockPageUrl,
+    stockLookupUrl: stockLookupUrl,
+    parseStockQuote: parseStockQuote,
+    formatStockChange: formatStockChange,
     parseUrlQuery: parseUrlQuery,
     webSearchUrl: webSearchUrl,
+    parseBangQuery: parseBangQuery,
     parseConversionQuery: parseConversionQuery,
     unitFor: unitFor,
     parseUnitQuery: parseUnitQuery,
@@ -1691,6 +2018,14 @@ if (typeof module !== "undefined") {
     parseKillQuery: parseKillQuery,
     parseProcessList: parseProcessList,
     formatMemory: formatMemory,
+    parseFileQuery: parseFileQuery,
+    parseFileList: parseFileList,
+    fileFrecency: fileFrecency,
+    parseFileHistory: parseFileHistory,
+    recordFileOpen: recordFileOpen,
+    serializeFileHistory: serializeFileHistory,
+    rankedFileHistory: rankedFileHistory,
+    mergeFileResults: mergeFileResults,
     parseTimeQuery: parseTimeQuery,
     resolveZone: resolveZone,
     parseZoneOffset: parseZoneOffset,

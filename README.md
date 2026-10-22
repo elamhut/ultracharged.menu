@@ -31,6 +31,73 @@ and `install.sh` stay ordinary searches. Links open with
 window. Web search goes to DuckDuckGo — change `webSearchTemplate` in
 `Menu.qml` for anything else.
 
+### Bangs
+
+DuckDuckGo-style prefixes send a search straight to a site.
+
+| Type | Get |
+| --- | --- |
+| `!y lofi beats` | Searches YouTube |
+| `!yh weather` | Searches Yahoo |
+| `!g omarchy` | Searches Google |
+| `!ddg omarchy` | Searches DuckDuckGo |
+| `!a usb-c hub` | Searches Amazon |
+| `!ml iphone 13` | Searches Mercado Livre |
+| `! omarchy` | Searches with the default engine |
+| `!y` | Opens YouTube itself |
+
+A bang takes over the list: nothing in the menu competes with it. Bangs are
+case-insensitive and must come first. An unknown bang (`!w`) stays an ordinary
+search, so the DuckDuckGo fallback can still resolve it with its own bang list.
+Adding a bang is one line in the `BANGS` table in `MenuModel.js`.
+
+### Find files
+
+| Type | Get |
+| --- | --- |
+| `?invoice` | Files and folders under your home whose name contains `invoice` |
+| `? menu.qml` | The space after `?` is optional |
+| `?` | Your favourite files, ready to open |
+
+Enter opens the file with its default application (`xdg-open`), or a folder in
+your file manager. Exact names come first, then names that start with what you
+typed, then the rest, with shallower paths ahead of deeper ones.
+
+**Favourites.** Every file you open from here is remembered, ranked by
+*frecency*: each open adds to its score, and the score halves for every two
+weeks it goes unopened. The files you use now rise, and last month's project
+sinks on its own. A bare `?` lists the top eight. While you type, matching
+favourites (marked 󰓎) lead the list straight away, before the disk search
+finishes. Files that no longer exist are dropped. The list is kept at
+`~/.local/state/omarchy/menu-file-history.json`; delete it to start over.
+
+The search is [`fd`](https://github.com/sharkdp/fd), which ships with Omarchy.
+It matches names, not contents, ignores case, and, as fd does by default,
+skips hidden and gitignored files, so caches and build output don't bury what
+you are after. fd runs once per name you type, never two at a time, and the
+previous results stay narrowed on screen while the next search runs.
+
+### Stock quotes
+
+| Type | Get |
+| --- | --- |
+| `$auvp11` | `150.49 BRL  ▼ 1.27 (0.84%)` · `AUVP11.SA · BTGTEVA AUVPCI · São Paulo · 16:19` |
+| `$aapl` | `347.38 USD  ▲ 3.39 (0.99%)` |
+| `$btc-usd` | Crypto pairs work too |
+| `$^bvsp` | And indices |
+
+Enter opens the quote on Yahoo Finance. Type the ticker the way you know it:
+Yahoo's search finds the listing (`AUVP11` trades as `AUVP11.SA`). The change
+is against the previous close, and the time is when the price was set, in the
+exchange's own time zone.
+
+Quotes come from Yahoo Finance's public endpoints, with no API key, and only
+once you type a `$` ticker. One fetch runs at a time and a quote is reused for a
+minute, so typing a ticker letter by letter doesn't fire a request per letter.
+Nothing is found, or you're offline? Enter searches Yahoo Finance instead. A
+ticker starts with a letter, which is what keeps `$120 to eur` a currency
+conversion.
+
 ### Unit conversion
 
 | Type | Get |
@@ -97,6 +164,18 @@ Enter sends `SIGTERM`. Nothing runs `ps` until `kill` is typed, and the listing
 is reused for a few seconds rather than re-run on every keystroke.
 
 <img width="612" height="285" alt="image" src="https://github.com/user-attachments/assets/9d0e490d-c74d-466c-82a9-f0d05adf9f27" />
+
+### Search synonyms
+
+| Type | Get |
+| --- | --- |
+| `restart` | **Reboot** |
+| `turn off` | **Shutdown** |
+
+Some menu entries answer to the words people actually reach for. Synonyms only
+find an entry: unlike `aliases` in `omarchy-menu.jsonc`, they are not
+`omarchy menu summon` routes, so they cannot clash with one (`restart` is
+already Update's). Add more in the `SEARCH_SYNONYMS` table in `MenuModel.js`.
 
 ### Edit the search line
 

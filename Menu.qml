@@ -118,7 +118,7 @@ Item {
   }
   property bool deleteConfirmOpen: false
   property var deleteTarget: null
-  onOpenedChanged: if (!opened) { deleteConfirmOpen = false; deleteTarget = null; utilityAnswers = ({}) }
+  onOpenedChanged: if (!opened) { deleteConfirmOpen = false; deleteTarget = null; utilityAnswers = ({}); fileList = ""; fileListPattern = ""; pendingDeadKey = "" }
   // Currency conversion typed into the search: "123 eur to usd". The rates
   // behind it are exchangerate-api's free daily snapshot, which needs no key,
   // cached under ~/.cache and refetched about once a day.
@@ -141,6 +141,20 @@ Item {
   // The last `ps` listing, and when it was taken.
   property string processList: ""
   property real processListedAt: 0
+  // The last file search fd finished, and the name it was asked for.
+  property string fileList: ""
+  property string fileListPattern: ""
+  readonly property string homeDir: Quickshell.env("HOME")
+  // Files opened from "?" and how much each is wanted -- see the favourites
+  // section of MenuModel.js.
+  property var fileHistory: ({})
+  property bool fileHistoryRead: false
+  property bool fileHistoryDirty: false
+  readonly property string fileHistoryPath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omarchy/menu-file-history.json"
+  readonly property int fileHistoryCeiling: 262144
+  // Quotes fetched this session, by ticker: { quote, at }, quote null when
+  // Yahoo had nothing for it.
+  property var stockQuotes: ({})
   // The system's zone database, borrowed rather than reimplemented: the zone
   // list from timedatectl, and each zone's current offset from `date`. The
   // engine QML runs has no Intl, so the offset is what the clock is built on.
@@ -726,6 +740,9 @@ Item {
   // it, since "ml" is not money.
   function queryRows(query) {
     var builders = [
+      root.bangRow,
+      root.fileRows,
+      root.stockRow,
       root.calculatorRow,
       root.currencyRow,
       root.unitRow,
@@ -983,6 +1000,214 @@ Item {
     return rows
   }
 
+  // "?report" finds files by name under home. Unlike `ps`, the answer depends
+  // on what was typed, so fd runs once per name -- but never twice at once:
+  // keystrokes that land while it walks are caught up with when it finishes.
+  // Until then the last listing, narrowed to the new name, stands in.
+  function fileRows(query) {
+    var pattern = MenuModel.parseFileQuery(query)
+    if (pattern === null) return null
+
+    root.ensureFileHistory()
+    var now = Math.floor(Date.now() / 1000)
+
+    // A bare "?" is the quick-access list: the files opened most, lately.
+    if (!pattern) {
+      var top = MenuModel.rankedFileHistory(root.fileHistory, "", root.homeDir, now, 8)
+      if (top.length === 0) {
+        return [root.queryRow({
+          kind: "file", icon: "󰈞",
+          label: "Find a file", detail: "Type part of a file name · files you open are kept here", ready: false
+        })]
+      }
+      return root.fileResultRows(top, true)
+    }
+
+    root.ensureFileSearch(pattern)
+
+    // Favourites answer at once and lead; fd fills in behind them. They are
+    // held to five so a name that matches many of them still leaves room for
+    // what has never been opened.
+    var favourites = MenuModel.rankedFileHistory(root.fileHistory, pattern, root.homeDir, now, 5)
+    var found = MenuModel.parseFileList(root.fileList, pattern, root.homeDir, 8)
+    var merged = MenuModel.mergeFileResults(favourites, found, 8)
+    if (merged.length === 0) {
+      var searching = fileProc.running || root.fileListPattern !== pattern
+      return [root.queryRow({
+        kind: "file", icon: "󰈞",
+        label: pattern, detail: searching ? "Searching files…" : "No file by that name", ready: false
+      })]
+    }
+
+    return root.fileResultRows(merged, false)
+  }
+
+  // A directory's payload keeps its trailing "/", which is how openFile knows
+  // to remember it as one -- the row has nowhere else to carry that.
+  function fileResultRows(files, allFavourites) {
+    var rows = []
+    for (var i = 0; i < files.length; i++) {
+      var favourite = allFavourites || files[i].frecency !== undefined
+      rows.push(root.queryRow({
+        id: "file." + files[i].path,
+        kind: "file",
+        icon: favourite ? "󰓎" : (files[i].isDir ? "󰉋" : "󰈔"),
+        label: files[i].name,
+        detail: files[i].dir,
+        payload: files[i].path + (files[i].isDir ? "/" : "")
+      }))
+    }
+    return rows
+  }
+
+  // Read the first time "?" is typed, not at startup, so a menu never used to
+  // find files never touches the file. Once read, every remembered path is
+  // checked to still exist, and the ones that do not are let go.
+  function ensureFileHistory() {
+    if (root.fileHistoryRead) return
+    root.fileHistoryRead = true
+    fileHistoryProc.command = root.readFileCommand(root.fileHistoryPath, root.fileHistoryCeiling)
+    fileHistoryProc.running = true
+  }
+
+  function pruneFileHistory() {
+    var paths = Object.keys(root.fileHistory)
+    if (paths.length === 0 || fileExistsProc.running) return
+    var quoted = []
+    for (var i = 0; i < paths.length; i++) quoted.push(Util.shellQuote(paths[i]))
+    fileExistsProc.command = root.boundedCommand(
+      'for p in ' + quoted.join(" ") + '; do [ -e "$p" ] && printf "%s\\0" "$p"; done; true',
+      5, 1048576)
+    fileExistsProc.running = true
+  }
+
+  function recordFileOpen(path, isDir) {
+    var now = Math.floor(Date.now() / 1000)
+    root.fileHistory = MenuModel.recordFileOpen(root.fileHistory, path, isDir, now)
+    root.saveFileHistory()
+  }
+
+  // Written the way the rates cache is: into a directory checked to be ours,
+  // through a mktemp name, and renamed into place, so a write cut off halfway
+  // leaves the old list rather than half of a new one. One write at a time;
+  // an open that lands during a write is saved when it finishes.
+  function saveFileHistory() {
+    if (fileSaveProc.running) {
+      root.fileHistoryDirty = true
+      return
+    }
+    root.fileHistoryDirty = false
+
+    var target = root.fileHistoryPath
+    var directory = target.substring(0, target.lastIndexOf("/"))
+    var script = [
+      'set -u',
+      'd=' + Util.shellQuote(directory),
+      't=',
+      'cleanup() { [ -n "$t" ] && rm -f -- "$t"; }',
+      'trap cleanup EXIT',
+      'mkdir -p -m 700 -- "$d" 2>/dev/null',
+      'if [ -L "$d" ] || [ ! -d "$d" ]; then exit 1; fi',
+      'find "$d" -maxdepth 0 -uid "$(id -u)" ! -perm /022 -print -quit 2>/dev/null | grep -q . || exit 1',
+      't=$(mktemp -- "$d/.file-history.XXXXXXXXXXXX") || exit 1',
+      'printf "%s" "$1" > "$t" || exit 1',
+      'mv -f -- "$t" ' + Util.shellQuote(target) + ' || exit 1',
+      't='
+    ].join("\n")
+
+    fileSaveProc.command = ["timeout", "5", "bash", "-c", script, "bash",
+                            MenuModel.serializeFileHistory(root.fileHistory)]
+    fileSaveProc.running = true
+  }
+
+  // Hidden and gitignored files are left out, as fd does by default: what
+  // they hold is mostly caches and build output, which would bury the file
+  // being looked for. The pattern is matched as a fixed string, not a regex.
+  function ensureFileSearch(pattern) {
+    if (fileProc.running || pattern === root.fileListPattern) return
+
+    fileProc.pattern = pattern
+    fileProc.command = root.boundedCommand(
+      "fd -0 --ignore-case --fixed-strings --max-results 2000 -- "
+      + Util.shellQuote(pattern) + " " + Util.shellQuote(root.homeDir), 5, 1048576)
+    fileProc.running = true
+  }
+
+  // "$auvp11": the price, the day's move, and Enter opens the quote on Yahoo
+  // Finance. Nothing is fetched until a ticker is typed, one fetch runs at a
+  // time, and a quote is reused for a minute -- a ticker typed letter by
+  // letter asks for the last one once the typing settles, not for every
+  // prefix of it.
+  function stockRow(query) {
+    var ticker = MenuModel.parseStockQuery(query)
+    if (ticker === null) return null
+
+    if (!ticker) {
+      return root.queryRow({
+        kind: "url", icon: "󰄨",
+        label: "Stock quote", detail: "Type a ticker, like $AAPL or $PETR4", ready: false
+      })
+    }
+
+    root.ensureStockQuote(ticker)
+    var known = root.stockQuotes[ticker]
+
+    if (!known) {
+      return root.queryRow({
+        kind: "url", icon: "󰄨",
+        label: ticker, detail: "Fetching quote…", ready: false
+      })
+    }
+
+    // Nothing found, or no network. Enter still has somewhere useful to go.
+    if (!known.quote) {
+      return root.queryRow({
+        kind: "url", icon: "󰄨",
+        label: ticker, detail: "No quote found · Enter searches Yahoo Finance",
+        payload: MenuModel.stockLookupUrl(ticker)
+      })
+    }
+
+    var quote = known.quote
+    var price = MenuModel.formatCurrencyValue(quote.price) + (quote.currency ? " " + quote.currency : "")
+    var change = MenuModel.formatStockChange(quote)
+    var detail = [quote.symbol, quote.name, quote.exchange]
+    if (quote.time) detail.push(MenuModel.zoneClock(quote.time * 1000, quote.offset).time)
+
+    return root.queryRow({
+      kind: "url",
+      icon: quote.change > 0 ? "󰔵" : (quote.change < 0 ? "󰔳" : "󰄨"),
+      label: price + (change ? "  " + change : ""),
+      detail: detail.filter(function(part) { return part }).join(" · "),
+      payload: MenuModel.stockPageUrl(quote.symbol)
+    })
+  }
+
+  // Yahoo's search turns the ticker into its own symbol and the chart
+  // endpoint prices it. The symbol comes back from the network, so it is
+  // checked against the ticker character set before it goes into a URL.
+  function ensureStockQuote(ticker) {
+    var known = root.stockQuotes[ticker]
+    var now = Math.floor(Date.now() / 1000)
+    if (known && now - known.at < 60) return
+    if (stockProc.running) return
+
+    stockProc.ticker = ticker
+    stockProc.command = root.boundedCommand([
+      'set -u',
+      'ua="Mozilla/5.0 (X11; Linux x86_64)"',
+      's=$(curl -fsS --max-time 5 --max-filesize 262144 -A "$ua" -- '
+        + Util.shellQuote(MenuModel.stockSearchUrl(ticker))
+        + ' | head -c 262144 | grep -o \'"symbol":"[^"]*"\' | head -n 1 | cut -d \'"\' -f 4)',
+      'case "$s" in ""|*[!A-Za-z0-9.^=-]*) exit 1;; esac',
+      '[ "${#s}" -le 24 ] || exit 1',
+      'e=${s//^/%5E}; e=${e//=/%3D}',
+      'curl -fsS --max-time 5 --max-filesize 262144 -A "$ua" -- '
+        + '"https://query1.finance.yahoo.com/v8/finance/chart/$e?range=1d&interval=1d"'
+    ].join("\n"), 12, 262144)
+    stockProc.running = true
+  }
+
   // Held for a few seconds rather than debounced: the listing is what is
   // expensive, and one that is seconds old is still the right answer to
   // "what is called firefox".
@@ -1094,6 +1319,36 @@ Item {
       label: "Search the web",
       detail: "Look up “" + query + "” on " + root.webSearchName,
       payload: url
+    })
+  }
+
+  // A bang says where the search goes, so it is the whole answer: "!y cats"
+  // searches YouTube, "! cats" the default engine. A known bang with nothing
+  // after it opens the site instead.
+  function bangRow(query) {
+    var bang = MenuModel.parseBangQuery(query)
+    if (!bang) return null
+
+    var name = bang.engine ? bang.engine.name : root.webSearchName
+    var template = bang.engine ? bang.engine.template : root.webSearchTemplate
+
+    if (!bang.terms) {
+      return root.queryRow({
+        kind: "websearch",
+        icon: "󰖟",
+        label: bang.engine ? "Open " + name : "Search the web",
+        detail: bang.engine ? bang.engine.home.replace(/^https?:\/\/(www\.)?/, "") : "Type what to look up on " + name,
+        payload: bang.engine ? bang.engine.home : "",
+        ready: !!bang.engine
+      })
+    }
+
+    return root.queryRow({
+      kind: "websearch",
+      icon: "󰍉",
+      label: "Search " + name,
+      detail: "Look up “" + bang.terms + "” on " + name,
+      payload: MenuModel.webSearchUrl(bang.terms, template)
     })
   }
 
@@ -1309,8 +1564,12 @@ Item {
     if (query) {
       var currentRows = []
       var drilldownRows = []
+      // A bang, a "?" file search or a "$" quote has already said where the search goes;
+      // the menu stays out of it.
+      var claimed = MenuModel.parseBangQuery(query) || MenuModel.parseFileQuery(query) !== null
+                    || MenuModel.parseStockQuery(query) !== null
 
-      for (var i = 0; i < root.itemOrder.length; i++) {
+      for (var i = 0; !claimed && i < root.itemOrder.length; i++) {
         var entry = root.item(root.itemOrder[i])
         if (!entry || entry.id === "root") continue
         if (!root.isDescendantOf(entry.id, active)) continue
@@ -1433,6 +1692,58 @@ Item {
     root.caretIndex = Math.max(0, Math.min(root.filterText.length, root.caretIndex + delta))
   }
 
+  // The accent a dead key is holding until the next key says what it becomes.
+  property string pendingDeadKey: ""
+
+  function deadKeyText(key) {
+    if (key === Qt.Key_Dead_Circumflex) return "^"
+    if (key === Qt.Key_Dead_Grave) return "`"
+    if (key === Qt.Key_Dead_Tilde) return "~"
+    if (key === Qt.Key_Dead_Acute) return "'"
+    if (key === Qt.Key_Dead_Diaeresis) return "\""
+    return ""
+  }
+
+  // True when the event was a dead key, or the key that completes one, and
+  // has been dealt with here. Modifiers pass through without spending the
+  // accent: Shift is pressed between a dead key and a capital letter.
+  function handleDeadKey(event) {
+    var dead = root.deadKeyText(event.key)
+    if (dead) {
+      // Pressing a second one gives up on the first, as the layout does.
+      if (root.pendingDeadKey) root.insertAtCaret(root.pendingDeadKey)
+      root.pendingDeadKey = dead
+      return true
+    }
+
+    if (!root.pendingDeadKey) return false
+    if (event.key === Qt.Key_Shift || event.key === Qt.Key_Control || event.key === Qt.Key_Alt
+        || event.key === Qt.Key_Meta || event.key === Qt.Key_AltGr || event.key === Qt.Key_CapsLock)
+      return false
+
+    var pending = root.pendingDeadKey
+    root.pendingDeadKey = ""
+    // Backspace and Escape take back the accent and nothing else.
+    if (event.key === Qt.Key_Backspace || event.key === Qt.Key_Escape) return true
+
+    var plain = (event.modifiers & ~(Qt.KeypadModifier | Qt.ShiftModifier)) === Qt.NoModifier
+    if (plain && root.printableText(event.text)) {
+      root.insertAtCaret(MenuModel.composeDeadKey(pending, event.text))
+      return true
+    }
+
+    // Anything else -- an arrow, Enter -- lands the accent as typed and then
+    // does what it does.
+    root.insertAtCaret(pending)
+    return false
+  }
+
+  // Text a key typed, rather than a control code. More than one character is
+  // fine: a layout that combines a dead key itself can hand over "^4" at once.
+  function printableText(text) {
+    return !!text && !/[\u0000-\u001f\u007f]/.test(text)
+  }
+
   function insertAtCaret(text) {
     if (!text) return
     var at = Math.max(0, Math.min(root.filterText.length, root.caretIndex))
@@ -1520,6 +1831,8 @@ Item {
       root.killProcess(row.target)
     } else if (row.kind === "url" || row.kind === "websearch") {
       root.openUrl(row.target)
+    } else if (row.kind === "file") {
+      root.openFile(row.target)
     } else if (row.kind === "calc" || row.kind === "currency" || row.kind === "unit"
              || row.kind === "util" || row.kind === "time") {
       root.copyToClipboard(row.target || row.label)
@@ -1590,6 +1903,20 @@ Item {
     opened = false
     filterText = ""
     Util.execDetached("omarchy-launch-browser " + Util.shellQuote(url))
+  }
+
+  // xdg-open hands the file to whatever the desktop has set for its type, and
+  // a directory to the file manager. fd only prints absolute paths, so none
+  // of them can be read as an option.
+  function openFile(path) {
+    if (!path) return
+    var isDir = path.length > 1 && path.charAt(path.length - 1) === "/"
+    if (isDir) path = path.slice(0, -1)
+    root.recordFileOpen(path, isDir)
+    applySerial = requestSerial
+    opened = false
+    filterText = ""
+    Util.execDetached("xdg-open " + Util.shellQuote(path))
   }
 
   // printf rather than echo so the result lands without a trailing newline,
@@ -1871,6 +2198,86 @@ Item {
   }
 
   Process {
+    id: fileProc
+    property string pattern: ""
+    // The output can land before the process is seen to stop; catching up
+    // here too means a name typed meanwhile is never left unsearched.
+    onRunningChanged: if (!running && root.filterText.trim()) Qt.callLater(root.rebuildDisplay)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.fileList = String(text || "")
+        root.fileListPattern = fileProc.pattern
+        // Rebuilding asks for whatever name is typed now, which starts the
+        // next search if it moved on while this one ran.
+        if (root.filterText.trim()) Qt.callLater(root.rebuildDisplay)
+      }
+    }
+  }
+
+  Process {
+    id: fileHistoryProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.fileHistory = MenuModel.parseFileHistory(String(text || ""))
+        root.pruneFileHistory()
+        if (root.filterText.trim()) root.rebuildDisplay()
+      }
+    }
+  }
+
+  Process {
+    id: fileExistsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var present = String(text || "").split("\u0000")
+        present.pop()
+        // Nothing came back for a list that was not empty: more likely the
+        // check failed than every file vanished, so keep the list as it is.
+        if (present.length === 0) return
+
+        var kept = ({})
+        for (var i = 0; i < present.length; i++) {
+          if (root.fileHistory[present[i]]) kept[present[i]] = root.fileHistory[present[i]]
+        }
+        if (Object.keys(kept).length === Object.keys(root.fileHistory).length) return
+        root.fileHistory = kept
+        root.saveFileHistory()
+        if (root.filterText.trim()) root.rebuildDisplay()
+      }
+    }
+  }
+
+  Process {
+    id: fileSaveProc
+    onRunningChanged: if (!running && root.fileHistoryDirty) root.saveFileHistory()
+  }
+
+  Process {
+    id: stockProc
+    property string ticker: ""
+    onRunningChanged: if (!running && root.filterText.trim()) Qt.callLater(root.rebuildDisplay)
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var next = ({})
+        for (var key in root.stockQuotes) next[key] = root.stockQuotes[key]
+        var quote = MenuModel.parseStockQuote(String(text || ""))
+        // A refresh that failed keeps the quote it had rather than replacing
+        // a slightly old price with none.
+        var previous = root.stockQuotes[stockProc.ticker]
+        next[stockProc.ticker] = {
+          quote: quote || (previous ? previous.quote : null),
+          at: Math.floor(Date.now() / 1000)
+        }
+        root.stockQuotes = next
+      }
+    }
+  }
+
+  Process {
     id: randomProc
     stdout: StdioCollector {
       waitForEnd: true
@@ -2080,6 +2487,11 @@ Item {
             return
           }
 
+          if (root.handleDeadKey(event)) {
+            event.accepted = true
+            return
+          }
+
           if (event.key === Qt.Key_Tab) {
             if (root.editingText) root.exitTextMode()
             else root.enterTextMode()
@@ -2141,7 +2553,7 @@ Item {
             } else if (root.cursorActive) root.activateIndex(root.selectedIndex)
             else root.settleCursor()
             event.accepted = true
-          } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127 && ((event.modifiers & ~Qt.KeypadModifier) === Qt.NoModifier || (event.modifiers & ~Qt.KeypadModifier) === Qt.ShiftModifier)) {
+          } else if (root.printableText(event.text) && ((event.modifiers & ~Qt.KeypadModifier) === Qt.NoModifier || (event.modifiers & ~Qt.KeypadModifier) === Qt.ShiftModifier)) {
             // KeypadModifier is masked off because Qt flags numpad keys with it
             // even when NumLock makes them deliver their character.
             root.insertAtCaret(event.text)
