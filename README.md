@@ -1,4 +1,7 @@
-# Supercharged Omarchy Menu
+# Ultracharged Omarchy Menu
+
+A maintained fork of [dzhibas/omarchy.dzhibas.menu](https://github.com/dzhibas/omarchy.dzhibas.menu)
+(the Supercharged Omarchy menu), with fixes for current Omarchy releases.
 
 A fork of the Omarchy command menu that answers questions instead of only
 finding commands.
@@ -143,5 +146,5 @@ guessing at. Crypto is not supported — the rate source is fiat only.
 ## Install
 
 ```bash
-omarchy plugin install https://github.com/dzhibas/omarchy.dzhibas.menu
+omarchy plugin add https://github.com/elamhut/ultracharged-menu --enable
 omarchy restart shell
