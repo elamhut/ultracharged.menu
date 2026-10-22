@@ -4,6 +4,7 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
+import qs.services
 import "MenuModel.js" as MenuModel
 
 Item {
@@ -86,7 +87,21 @@ Item {
 
   // Shared application engine (entries, hidden filters, icons, launch,
   // removal), owned by the shell and also used by the standalone launcher.
-  readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
+  //
+  // Omarchy 4.0.x hands a third-party menu a shell facade whose appLibrary is
+  // null: the panel loader passes a manifest whose `kinds` fails the host's
+  // Array.isArray check, so the facade is rebuilt without the menu capability
+  // and the Apps submenu comes up empty. When that happens, run a private copy
+  // of the shell's own AppLibrary instead.
+  readonly property var appLibrary: (root.shell && root.shell.appLibrary)
+    || fallbackAppLibrary.item || null
+  onAppLibraryChanged: if (root.providersLoaded["apps"]) root.mergeAppRows()
+
+  Loader {
+    id: fallbackAppLibrary
+    active: !!root.shell && !root.shell.appLibrary
+    sourceComponent: Component { AppLibrary { } }
+  }
   property bool deleteConfirmOpen: false
   property var deleteTarget: null
   onOpenedChanged: if (!opened) { deleteConfirmOpen = false; deleteTarget = null; utilityAnswers = ({}) }
