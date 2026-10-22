@@ -14,6 +14,15 @@ exactly as before.
 
 ## Features
 
+Three prefixes say what kind of search you want; everything else is answered
+as you type.
+
+| Prefix | Does | Example |
+| --- | --- | --- |
+| `!` | Searches a site ([bangs](#bangs)) | `!y lofi beats` |
+| `?` | Finds a file ([files](#find-files)) | `?invoice` |
+| `$` | Quotes a stock ([quotes](#stock-quotes)) | `$aapl` |
+
 ### Open links and search the web
 
 | Type | Get |
@@ -184,6 +193,11 @@ enter text mode; **Tab** or **Escape** leaves it. In text mode **←/→** move
 the caret, **Home/End** jump to the ends, **Backspace** deletes before the
 caret (**Ctrl+Backspace** deletes a word), and typing or pasting lands at the
 caret. Outside text mode, keys navigate the list as before.
+
+Dead keys work. On layouts like US international, `^`, `` ` ``, `~`, `'` and
+`"` combine with the next key just as they do in any other app: `^` then `4` types `^4`
+(so `2^4` is `16`), `^` then `a` types `â`, `'` then `c` types `ç`, and an
+accent then space types the accent alone.
 
 ### Calculator
 
